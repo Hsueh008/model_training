@@ -1,12 +1,14 @@
 import os
 import glob
+import json
 import torch
 import wandb
 import random
+import numpy as np
 from datasets import load_dataset, concatenate_datasets, Features, Value
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, SFTConfig
 from torch.utils.data import SequentialSampler, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -36,61 +38,93 @@ def prepare_messages(example):
     return {"messages": messages}
 
 # ==========================================
+# 定義難度分數字典 (由你的分析結果提供)
+# ==========================================
+model_id = "Qwen/Qwen2.5-3B"
+data_dir = "data/5_evaluation_qwen_instruct_jsonl"
+
+ifd_file_name = f"metadata/{model_id.split('/')[-1]}-ifd-score.json"
+difficulty_scores = json.load(open(ifd_file_name, "r", encoding="utf-8"))
+
+category_names = sorted(difficulty_scores.keys(), key=lambda k: difficulty_scores[k][0])
+
+# ==========================================
 # 1. 載入資料與分層抽樣
 # ==========================================
-data_dir = "/home/S113062615/build_dataset/dataset_jsonl"
-file_paths = glob.glob(f"{data_dir}/*.jsonl")
-
-train_dict = {}
-eval_sampled_datasets = []
 
 TRAIN_SIZE = 1000
 EVAL_SIZE = 200
+STAGE_SIZE = 1000
+NEW_CONCEPT_RATIO = 0.5
 SEED = 42
 
+PERCENTILE_THRESHOLD = 25
 
-for path in file_paths:
-    dataset_name = os.path.basename(path).replace(".jsonl", "")
+stats_list = []
+eval_sampled_datasets = []
+ordered_train_datasets = []
+
+# ==========================================
+# 核心迴圈：依序載入 -> 抽樣算統計 -> 轉換 -> 滾雪球
+# ==========================================
+for k, name in enumerate(category_names):
+    score = difficulty_scores[name][0]
+    
+    path = os.path.join(data_dir, f"{name}.jsonl")
+    if not os.path.exists(path):
+        print(f"  [警告] 找不到檔案: {path}，跳過此階段！")
+        continue
 
     raw_dataset = load_dataset("json", data_files=path, split="train")
-    raw_dataset = raw_dataset.map(
-        prepare_messages,
-        remove_columns=raw_dataset.column_names,
-        desc=f"Standardizing {dataset_name}"
+
+    all_scores = raw_dataset["ifd_score"]
+    threshold_value = np.percentile(all_scores, PERCENTILE_THRESHOLD)
+
+    filtered_dataset = raw_dataset.filter(
+        lambda x: x["ifd_score"] >= threshold_value
     )
-    shuffled_raw = raw_dataset.shuffle(seed=SEED)
 
-    train_ds = shuffled_raw.select(range(TRAIN_SIZE))
-    eval_ds = shuffled_raw.select(range(TRAIN_SIZE, TRAIN_SIZE + EVAL_SIZE))
+    shuffled_filtered = filtered_dataset.shuffle(seed=SEED)
+    train_raw_ds = shuffled_filtered.select(range(TRAIN_SIZE))
+    eval_raw_ds = shuffled_filtered.select(range(TRAIN_SIZE, TRAIN_SIZE + EVAL_SIZE))
 
-    train_dict[dataset_name] = train_ds
+    stats_list.append({
+        "dataset_name": name,
+        "train_mean": np.mean(train_raw_ds["ifd_score"]),
+        "train_std": np.std(train_raw_ds["ifd_score"]),
+        "eval_mean": np.mean(eval_raw_ds["ifd_score"]),
+        "eval_std": np.std(eval_raw_ds["ifd_score"])
+    })
+
+    train_ds = train_raw_ds.map(prepare_messages, remove_columns=raw_dataset.column_names)
+    eval_ds = eval_raw_ds.map(prepare_messages, remove_columns=raw_dataset.column_names,)
     eval_sampled_datasets.append(eval_ds)
 
+    stage_ds = train_ds.shuffle(seed=SEED+k)
+    ordered_train_datasets.append(stage_ds)
+
+
 # ==========================================
-# 2. 合併資料與全局打亂
+# 最終資料集組合與輸出統計
 # ==========================================
-category_names = list(train_dict.keys())
-random.seed(SEED)
-random.shuffle(category_names)
-
-print("\n🎲 本次盲猜的 Curriculum 訓練順序 (請務必記錄下來)：")
-for i, name in enumerate(category_names):
-    print(f"Stage {i+1}: {name}")
-print("\n")
-
-ordered_train_datasets = []
-for name in category_names:
-    ordered_train_datasets.append(train_dict[name])
-
+# 嚴格按順序接起來 (絕對不可 shuffle 全局！)
 curriculum_train_dataset = concatenate_datasets(ordered_train_datasets)
 
-combined_eval = concatenate_datasets(eval_sampled_datasets)
-eval_dataset = combined_eval.shuffle(seed=SEED)
+# 驗證集維持全局打亂不變
+eval_dataset = concatenate_datasets(eval_sampled_datasets).shuffle(seed=SEED)
+
+# print("\n" + "="*50)
+# print("IFD Score Statistics Summary")
+# print("="*50)
+# for stats in stats_list:
+#     print(f"Dataset: {stats['dataset_name']}")
+#     print(f"  [Train] Mean: {stats['train_mean']:.4f}, Std: {stats['train_std']:.4f}")
+    # print(f"  [Eval]  Mean: {stats['eval_mean']:.4f}, Std: {stats['eval_std']:.4f}")
+    # print("-" * 50)
 
 # ==========================================
 # 3. 載入 Tokenizer (必須先載入，才能在接下來的函數中使用)
 # ==========================================
-model_id = "Qwen/Qwen2.5-3B-Instruct"
 print(f"正在載入 Tokenizer ({model_id})...")
 
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -98,11 +132,13 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right" 
 
+new_chat_template = open(f"metadata/{model_id.split('/')[-1]}-new-chat-template.txt", "r", encoding="utf-8").read().replace('\\\\', '\\')
+
+tokenizer.chat_template = new_chat_template
 # ==========================================
 # 4. 定義 Prompt 格式化函數 (使用 apply_chat_template)
 # ==========================================
 def formatting_prompts_func(example):
-    output_texts = []
     inst = example['instruction']
     const = example['constraint']
     resp = example['response']
@@ -113,7 +149,7 @@ def formatting_prompts_func(example):
         user_content = f"### Instruction:\n{inst}"
         
     messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
+        # {"role": "system", "content": "You are a helpful assistant."}, # <--- Qwen2.5 has default system prompt
         {"role": "user", "content": user_content},
         {"role": "assistant", "content": resp}
     ]
@@ -139,22 +175,22 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.config.use_cache = False
 
-peft_config = LoraConfig(
-    r=16,               
-    lora_alpha=32,      
-    lora_dropout=0.1,
-    bias="none",
-    task_type="CAUSAL_LM",
-    target_modules=["q_proj", "v_proj"] 
-)
+# peft_config = LoraConfig(
+#     r=16,               
+#     lora_alpha=32,      
+#     lora_dropout=0.1,
+#     bias="none",
+#     task_type="CAUSAL_LM",
+#     target_modules=["q_proj", "v_proj"] 
+# )
 
 # ==========================================
 # 5.5 初始化 WandB (建議加在 TrainingArguments 之前)
 # ==========================================
 timestamp = datetime.now().strftime("%m%d-%H%M")
 
-output_name = f"qwen_2_5_3B_cl_{timestamp}"
-wandb_name = f"curriculum-random-{timestamp}"
+output_name = f"qwen2.5-3B-scl-ordering-{timestamp}"
+wandb_name = f"snowballing-curriculum-random-search-{timestamp}"
 
 wandb.init(
     project="qwen-constraint-finetune",     
@@ -168,66 +204,99 @@ wandb.init(
 class CurriculumTrainer(SFTTrainer):
     def _get_train_sampler(self, dataset=None):
         train_dataset = dataset if dataset is not None else self.train_dataset
-        
         if train_dataset is None:
             return None
-            
         return SequentialSampler(train_dataset)
 
-
-# 1. 告訴 Collator Assistant 回覆的起始標籤 (針對 Qwen)
-response_template = "<|im_start|>assistant\n"
-
-# 2. 建立只計算 Assistant loss 的 Collator
-collator = DataCollatorForCompletionOnlyLM(
-    response_template=response_template, 
-    tokenizer=tokenizer,
-    instruction_template="<|im_start|>user\n" # 加上 instruction_template 更保險
-)
-    
-
 sft_config = SFTConfig(
-    output_dir=f"./{output_name}_results",
+    output_dir=f"models/{output_name}_results",
     max_length=2048,
-    num_train_epochs=3,                  
-    per_device_train_batch_size=8,       
-    per_device_eval_batch_size=8,        
-    gradient_accumulation_steps=2,       
-    learning_rate=5e-5,                  
-    logging_steps=10,                    
-    eval_strategy="steps",         
-    eval_steps=200,                      
-    save_strategy="steps",               
-    save_steps=200,                      
-    save_total_limit=3,                  
-    bf16=True,                           
-    optim="adamw_torch",                 
-    lr_scheduler_type="cosine",          
-    weight_decay=0.1,
-    warmup_ratio=0.2,     
+    num_train_epochs=1,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=8,
+    gradient_accumulation_steps=4,
+    learning_rate=1e-5,
+    logging_steps=10,
+    eval_strategy="steps",
+    eval_steps=100,
+    save_strategy="steps",
+    save_steps=100,
+    save_total_limit=10,
+    bf16=True,
+    optim="adamw_torch",
+    lr_scheduler_type="cosine",
+    weight_decay=0.01,
+    warmup_ratio=0.2,
     report_to="wandb",
     run_name=wandb_name,
     ddp_find_unused_parameters=False,
+    assistant_only_loss=True,
+    # Full FT (Lora FT 需註解掉)
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={'use_reentrant': False}
 )
 
 trainer = CurriculumTrainer(
     model=model,
     train_dataset=curriculum_train_dataset, 
     eval_dataset=eval_dataset,
-    peft_config=peft_config,                  
+    # peft_config=peft_config,                 
     processing_class=tokenizer,
     args=sft_config,
-    data_collator=collator,
 )
 
-# 開始訓練
+# ==========================================
+# 6.5 訓練前驗證：將第一個 Batch 的 Masking 寫入 Log 檔
+# ==========================================
+import os
+
+def check_masking_to_log(trainer, tokenizer, log_file="masking_check.log"):
+    print(f"正在生成 Token Masking 檢查日誌至 {log_file} ...")
+    
+    # 直接向 Trainer 索取準備好餵給模型的 DataLoader
+    train_dataloader = trainer.get_train_dataloader()
+    
+    # 抽出第一個 Batch
+    batch = next(iter(train_dataloader))
+    
+    # 取出 Batch 中的第一筆資料
+    input_ids = batch["input_ids"][0]
+    labels = batch["labels"][0]
+    
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.write("="*60 + "\n")
+        f.write(f"Masking Check Log\n")
+        f.write("="*60 + "\n")
+        f.write(f"{'Token (解碼後)':<30} | {'Label ID'}\n")
+        f.write("-" * 60 + "\n")
+        
+        for i in range(len(input_ids)):
+            token_id = input_ids[i].item()
+            label_id = labels[i].item()
+            
+            # 將單個 Token 解碼回文字 (使用 repr 顯示換行符號 \n 等)
+            token_str = repr(tokenizer.decode([token_id])) 
+            
+            if label_id == -100:
+                f.write(f"{token_str:<30} | -100  (不計算 Loss)\n")
+            else:
+                f.write(f"{token_str:<30} | {label_id:<5} <--- 模型學習預測目標\n")
+                
+    print(f"✅ 檢查日誌已儲存！請打開 {log_file} 確認 -100 的位置是否正確。")
+
+# 執行檢查函數
+check_masking_to_log(trainer, tokenizer, log_file="masking_check.log")
+
+# ==========================================
+# 7. 開始訓練
+# ==========================================
 trainer.train()
 wandb.finish()
 
 # ==========================================
 # 7. 儲存最終模型
 # ==========================================
-output_dir_final = f"./{output_name}_final"
+output_dir_final = f"models/{output_name}_final"
 trainer.model.save_pretrained(output_dir_final)
 tokenizer.save_pretrained(output_dir_final)
 

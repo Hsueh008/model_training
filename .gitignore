@@ -2,3 +2,8 @@ models*
 _qwen*
 wandb*
 reference_code*
+*.log
+
+__archive__/
+__pycache__/
+data/

@@ -1,4 +1,5 @@
 models*
+data*
 _qwen*
 wandb*
 reference_code*
@@ -6,4 +7,3 @@ reference_code*
 
 __archive__/
 __pycache__/
-data/
